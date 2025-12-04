@@ -1,7 +1,13 @@
 ﻿module;
 
-#include <windows.h>
+#include "splash_data.h"
+#include <comdef.h>
+#include <gdiplus.h>
 #include <imagehlp.h>
+#include <shlwapi.h>
+#include <windows.h>
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "imagehlp.lib")
 
 export module xantidbg;
@@ -10,6 +16,10 @@ import <vector>;
 import <optional>;
 import <stdexcept>;
 import <functional>;
+import <span>;
+import <random>;
+import <string>;
+import <memory>;
 import crc32c;
 
 #ifndef NT_SUCCESS
@@ -362,6 +372,155 @@ private:
 	std::optional<XAntiDebugCallback> cb_;
 };
 
+std::unique_ptr<Gdiplus::Image> load_image(std::span<const uint8_t> data) {
+	IStream* stream(SHCreateMemStream(data.data(), static_cast<UINT>(data.size())));
+	if (!stream) {
+		return nullptr;
+	}
+
+	auto image = std::make_unique<Gdiplus::Image>(stream);
+	stream->Release();
+
+	if (image->GetLastStatus() != Gdiplus::Ok) {
+		return nullptr;
+	}
+
+	return image;
+}
+
+export class XAntiDebugSplash final {
+public:
+	XAntiDebugSplash() {
+		Gdiplus::GdiplusStartup(&gdi_token_, &gdi_startup_input_, nullptr);
+
+		image_ = load_image(splash_data);
+		if (!image_) {
+			throw std::runtime_error("");
+		}
+
+		SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+		image_width_ = image_->GetWidth();
+		image_height_ = image_->GetHeight();
+
+		const wchar_t* class_name = L"XAntiDebugSplash";
+		HMODULE instance = GetModuleHandleW(0);
+
+		WNDCLASSW wc{};
+		wc.lpfnWndProc = WndProc;
+		wc.hInstance = instance;
+		wc.lpszClassName = class_name;
+		wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+		wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+		RegisterClassW(&wc);
+
+		hwnd_ = CreateWindowExW(
+			WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+			class_name,
+			class_name,
+			WS_POPUP,
+			(GetSystemMetrics(SM_CXSCREEN) - image_width_) / 2,
+			(GetSystemMetrics(SM_CYSCREEN) - image_height_) / 2,
+			image_width_,
+			image_height_,
+			nullptr,
+			nullptr,
+			instance,
+			nullptr
+		);
+
+		SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+
+		ShowWindow(hwnd_, SW_SHOWNORMAL);
+		UpdateWindow(hwnd_);
+	}
+
+	~XAntiDebugSplash() {
+		image_.reset();
+
+		if (hwnd_) {
+			SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
+		}
+
+		if (gdi_token_) {
+			Gdiplus::GdiplusShutdown(gdi_token_);
+		}
+	}
+
+	void wnd_proc_loop() {
+		timer_ = SetTimer(hwnd_, 1, 60000, nullptr);
+
+		MSG msg{};
+		while (GetMessageW(&msg, nullptr, 0, 0)) {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+
+private:
+	Gdiplus::GdiplusStartupInput gdi_startup_input_;
+	ULONG_PTR gdi_token_ = 0;
+
+	std::unique_ptr<Gdiplus::Image> image_ = nullptr;
+
+	int image_width_ = 0;
+	int image_height_ = 0;
+
+	HWND hwnd_ = 0;
+
+	UINT timer_ = 0;
+	int click_count_ = 0;
+
+	static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+		auto self = reinterpret_cast<XAntiDebugSplash*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+		if (self) {
+			return self->HandleMessage(msg, wParam, lParam);
+		}
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
+	}
+
+	LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+		switch (msg) {
+		case WM_PAINT: {
+			PAINTSTRUCT ps;
+			HDC hdc = BeginPaint(hwnd_, &ps);
+			if (image_) {
+				Gdiplus::Graphics g(hdc);
+				g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+				g.DrawImage(image_.get(), 0, 0, image_width_, image_height_);
+			}
+			EndPaint(hwnd_, &ps);
+			return 0;
+		}
+
+		case WM_LBUTTONDOWN:
+			click_count_++;
+			if (click_count_ >= 10) {
+				PostQuitMessage(0);
+			}
+
+			return 0;
+
+		case WM_TIMER:
+			if (wParam == 1) {
+				KillTimer(hwnd_, 1);
+				PostQuitMessage(0);
+			}
+			return 0;
+
+		case WM_DESTROY:
+			PostQuitMessage(0);
+			return 0;
+
+		case WM_NCHITTEST:
+			return HTCLIENT;
+
+		default:
+			return DefWindowProcW(hwnd_, msg, wParam, lParam);
+		}
+	}
+};
+
 export bool bsod(DWORD code = 0xC0000005) noexcept {
 	auto proc1 = get_proc_address(L"ntdll", "RtlAdjustPrivilege");
 	auto proc2 = get_proc_address(L"ntdll", "NtRaiseHardError");
@@ -377,6 +536,18 @@ export bool bsod(DWORD code = 0xC0000005) noexcept {
 }
 
 volatile int* vptr = nullptr;
-export int terminateself_nullptr() noexcept {
-	return *vptr;
+export void debug_detected(bool real_bsod = false) noexcept /* 不要移除 noexcept，这是有意的 */ {
+	std::mt19937 rng{ std::random_device{}() };
+	std::uniform_real_distribution dist{ 0.0, 1.0 };
+
+	if (real_bsod && (dist(rng) < 0.1)) {
+		bsod();
+	}
+	else {
+		XAntiDebugSplash splash;
+		splash.wnd_proc_loop();
+	}
+	ExitProcess(0);
+	TerminateProcess(GetCurrentProcess(), 0);
+	throw std::runtime_error(std::to_string(*vptr));
 }
